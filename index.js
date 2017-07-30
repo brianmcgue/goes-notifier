@@ -1,24 +1,13 @@
 var config = require('./config');
-var casper = require('casper').create({
-  clientScripts: ['./jquery.min.js'],
-});
-var OAuth = require('oauth-1.0a');
-var jsSHA = require('jssha');
+var dateFunctions = require('./date');
+var casper = require('casper').create();
+var fs = require('fs');
+var path = require('path');
 
+var currentAppointmentPath = '/path/to/goes-notifier/current_appointment.json';
+var fileData = fs.read(currentAppointmentPath);
+var appointmentData = JSON.parse(fileData);
 
-var oauth = OAuth({
-  consumer: {
-    key: config.twitter.consumerKey,
-    secret: config.twitter.consumerSecret,
-  },
-  signature_method: 'HMAC-SHA1',
-  hash_function: function(base_string, key) {
-    var shaObj = new jsSHA('SHA-1', 'TEXT');
-    shaObj.setHMACKey(key, 'TEXT');
-    shaObj.update(base_string);
-    return shaObj.getHMAC('B64');
-  },
-});
 var url = 'https://goes-app.cbp.dhs.gov/goes/jsp/login.jsp';
 var username = config.username;
 var password = config.password;
@@ -35,14 +24,43 @@ var twilioLinked = (
   toNumber &&
   fromNumber
 );
-var twitterLinked = (
-  config.twitter.accessToken &&
-  config.twitter.accessTokenSecret &&
-  config.twitter.consumerKey &&
-  config.twitter.consumerSecret
-);
 var providedDay;
+var availableTimes;
+var betterTime;
+var betterAppointment;
 var notify;
+
+function getCurrentAppointment() {
+  return new Date(appointmentData.currentAppointment);
+}
+
+function recordNewAppointment(newDay) {
+  var previousAppointment = getCurrentAppointment();
+  var newAppointmentData = {
+    currentAppointment: newDay,
+    previousAppointment: previousAppointment,
+    allPreviousAppointments: appointmentData.allPreviousAppointments.concat(previousAppointment)
+  };
+  fs.write(currentAppointmentPath, JSON.stringify(newAppointmentData), 'w');
+}
+
+function notifyTwilio(newAppointment) {
+  this.open(
+    'https://' + accountSid + ':' + authToken + '@' +
+    'api.twilio.com/2010-04-01/Accounts/' + accountSid + '/Messages',
+    {
+      method: 'post',
+      data: {
+        To: toNumber,
+        From: fromNumber,
+        Body: 'New appointment slot open: ' + newAppointment,
+        MessagingServiceSid: serviceSid,
+      },
+    }
+  ).then(function() {
+    require('utils').dump(this.getPageContent());
+  });
+}
 
 function CasperException(message, stack) {
   this.name = 'CasperException';
@@ -68,11 +86,12 @@ casper.then(function() {
 
 casper.then(function() {
   this.echo('Clicking on login button...');
-  this.evaluate(function(u, p) {
-    $('#j_username').val(u);
-    $('#j_password').val(p);
-    $('#SignIn').click();
-  }, username, password);
+  this.wait(1000, function () {
+    this.fillSelectors('form[action="/goes/security_check"]', {
+      'input[name="j_username"]': username,
+      'input[name="j_password"]': password,
+    }, true);
+  });
 });
 
 casper.then(function() {
@@ -82,33 +101,27 @@ casper.then(function() {
 
 casper.then(function() {
   this.echo('Checkbox found. Clicking on checkbox...');
-  this.evaluate(function() {
-    $('#checkMe').click();
-  });
+  this.click('#checkMe');
 });
 
 casper.then(function() {
   this.echo('Waiting on manage appointments button...');
-  this.waitForSelector('input[name=manageAptm]');
+  this.waitForSelector('input[name="manageAptm"]');
 });
 
 casper.then(function() {
   this.echo('Appointments button found. Clicking on button...');
-  this.evaluate(function() {
-    $('input[name=manageAptm]').click();
-  });
+  this.click('input[name="manageAptm"]');
 });
 
 casper.then(function() {
   this.echo('Waiting on reschedule appointment button...');
-  this.waitForSelector('input[name=reschedule]');
+  this.waitForSelector('input[name="reschedule"]');
 });
 
 casper.then(function() {
   this.echo('Reschedule button found. Clicking on button...');
-  this.evaluate(function() {
-    $('input[name=reschedule]').click();
-  });
+  this.click('input[name="reschedule"]');
 });
 
 casper.then(function() {
@@ -118,10 +131,8 @@ casper.then(function() {
 
 casper.then(function() {
   this.echo('Airport table found, selecting next...');
-  this.evaluate(function(a) {
-    $('input[value=' + a + ']').click();
-    $('input[name=next]').click();
-  }, airport);
+  this.click('input[value="' + airport + '"]');
+  this.click('input[name="next"]');
 });
 
 casper.then(function() {
@@ -131,81 +142,63 @@ casper.then(function() {
 
 casper.then(function() {
   this.echo('Calendar found. Parsing date...');
-  providedDay = this.evaluate(function() {
-    var day = $('.date td')[0].innerHTML;
-    console.log(day);
-    var monthYear = $('.date div')[1].innerText;
-    console.log(monthYear);
-    return day + ' ' + monthYear;
-  });
+  var day = this.getHTML('.date td');
+  var monthYear = this.getHTML('.date tr:last-child div');
+  providedDay = day + ' ' + monthYear; // global
 });
 
 casper.then(function() {
   this.echo('Date found: ' + providedDay);
+  availableTimes = this.getElementsAttribute('.entry', 'title');
+});
 
-  var nextDay = new Date(providedDay);
-  var today = new Date();
-  console.log('Next available: ' + nextDay);
-  console.log('Today: ' + today);
-  var oneDay = 1000 * 60 * 60 * 24;
-  var numDays = Math.ceil(
-    (nextDay.getTime() - today.getTime()) / (oneDay)
-  );
-  this.echo('Number of days away: ' + numDays);
+casper.then(function () {
+  var currentAppointment = getCurrentAppointment();
+  this.echo('Current appointment: ' + currentAppointment);
+  betterTime = availableTimes.filter(function (time) {
+    var potentialDay = dateFunctions.createDateFromDayAndTime(providedDay, time);
+    return dateFunctions.betterDate(potentialDay, currentAppointment);
+  })[0];
+});
 
-  if (numDays < config.threshold) {
-    notify = true;
-    this.echo('New appointment slot available within a month');
+casper.then(function () {
+  if (betterTime) {
+    this.echo('Choosing the better available time: ' + betterTime);
+    this.click('.entry[title="' + betterTime + '"]');
   } else {
-    notify = false;
-    this.echo('No appointment slots available within a month');
+    this.echo('No better time available, exiting...')
+  }
+});
+
+casper.then(function () {
+  if (betterTime) {
+    this.echo('Filling in reason for new appointment');
+    this.fillSelectors('form[name="ConfirmationForm"]', { '#comments': 'Better timing' });
+    this.click('input[name="Confirm"]');
+  }
+});
+
+casper.then(function() {
+  if (betterTime) {
+    this.echo('Waiting for confirmation...');
+    this.capture('final.png')
+    this.waitForSelector('.sectionheader');
+  }
+});
+
+casper.then(function() {
+  if (betterTime && this.getHTML('.sectionheader') === 'Interview Scheduled ') {
+    betterAppointment = dateFunctions.createDateFromDayAndTime(providedDay, betterTime);
+    this.echo('Better appointment slot available: ' + betterAppointment);
+    recordNewAppointment(betterAppointment);
+    this.echo('Interview Scheduled');
+    notify = true;
   }
 });
 
 casper.then(function() {
   if (twilioLinked && notify) {
-    this.echo('Sending twilio request...');
-    this.open(
-      'https://' + accountSid + ':' + authToken + '@' +
-      'api.twilio.com/2010-04-01/Accounts/' + accountSid + '/Messages',
-      {
-        method: 'post',
-        data: {
-          To: toNumber,
-          From: fromNumber,
-          Body: 'New appointment slot open: ' + providedDay,
-          MessagingServiceSid: serviceSid,
-        },
-      }
-    ).then(function() {
-      require('utils').dump(this.getPageContent());
-    });
-  }
-});
-
-casper.then(function() {
-  if (twitterLinked && notify) {
-    this.echo('Sending twitter request...');
-    var message = 'New appointment slot open: ' + providedDay;
-    var requestData = {
-      url: 'https://api.twitter.com/1.1/statuses/update.json',
-      method: 'POST',
-      data: {
-        status: message,
-      },
-    };
-    var token = {
-      key: config.twitter.accessToken,
-      secret: config.twitter.accessTokenSecret,
-    };
-    this.open(
-      requestData.url,
-      {
-        method: requestData.method,
-        data: requestData.data,
-        headers: oauth.toHeader(oauth.authorize(requestData, token)),
-      }
-    );
+    notifyTwilio.bind(this)(betterAppointment);
   }
 });
 
